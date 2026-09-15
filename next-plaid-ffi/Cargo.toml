@@ -1,0 +1,39 @@
+# Standalone crate: the empty `[workspace]` table detaches this crate from the
+# parent next-plaid workspace (whose `members` list does not include it), so it
+# can pick iOS-friendly features/profiles without perturbing the parent's
+# lto/CUDA/dist config. Mirrors colgrep/python-sdk.
+[workspace]
+
+[package]
+name = "next-plaid-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "next_plaid_ffi"
+# staticlib -> Apple XCFramework; cdylib -> uniffi-bindgen --library metadata;
+# lib (rlib) -> host `cargo test` and the uniffi-bindgen bin.
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+next-plaid = { path = "../next-plaid" }
+uniffi = { version = "0.28", features = ["cli"] }
+thiserror = "1"
+ndarray = "0.16"
+# Metadata/text docs cross the FFI boundary as JSON strings; parsed to
+# `serde_json::Value` before handing to `next_plaid::filtering`.
+serde_json = "1"
+
+[features]
+# Route Apple Accelerate BLAS through the engine for device/macOS builds.
+accelerate = ["next-plaid/accelerate"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
