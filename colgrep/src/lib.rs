@@ -29,7 +29,7 @@ pub use index::{
     scan_reaches_subdir, IndexBuilder, SearchResult, Searcher, UpdatePlan, UpdateStats,
     CONFIRMATION_THRESHOLD,
 };
-pub use model::{ensure_model, resolve_quantized, DEFAULT_MODEL};
+pub use model::{ensure_model, resolve_quantized, uses_native_coreml, DEFAULT_MODEL};
 pub use onnx_runtime::{ensure_onnx_runtime, is_cudnn_available};
 pub use parser::{
     build_call_graph, detect_language, extract_units, is_text_format, CodeUnit, Language, UnitType,

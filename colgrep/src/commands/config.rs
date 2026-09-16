@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use colgrep::{
-    ensure_model, ensure_onnx_runtime, Config, DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MODEL,
-    DEFAULT_POOL_FACTOR,
+    acceleration::{env_acceleration_mode_lossy, AccelerationMode},
+    ensure_model, ensure_onnx_runtime, uses_native_coreml, Config, DEFAULT_MAX_RECURSION_DEPTH,
+    DEFAULT_MODEL, DEFAULT_POOL_FACTOR,
 };
 
 fn format_parallel_setting(config: &Config) -> String {
@@ -51,16 +52,27 @@ pub fn cmd_set_model(model: &str) -> Result<()> {
         }
     };
 
-    // Ensure ONNX Runtime is available before loading the model
-    ensure_onnx_runtime()?;
+    // The bundled MXBAI CoreML model uses native CoreML rather than ONNX Runtime.
+    if !uses_native_coreml(model, &model_path) {
+        ensure_onnx_runtime()?;
+    }
 
     // Try to load the model to verify it's compatible
     // Suppress stderr during model loading to hide CoreML's harmless
     // "Context leak detected" warnings on macOS
     let build_result = colgrep::stderr::with_suppressed_stderr(|| {
-        Colbert::builder(&model_path)
+        let builder = Colbert::builder(&model_path)
             .with_quantized(colgrep::resolve_quantized(&model_path, true))
-            .build()
+            .with_execution_provider(
+                if uses_native_coreml(model, &model_path)
+                    && env_acceleration_mode_lossy() == AccelerationMode::ForceCpu
+                {
+                    next_plaid_onnx::ExecutionProvider::Cpu
+                } else {
+                    next_plaid_onnx::ExecutionProvider::Auto
+                },
+            );
+        builder.build()
     });
     match build_result {
         Ok(_) => {

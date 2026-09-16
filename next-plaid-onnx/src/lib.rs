@@ -46,6 +46,8 @@
 //! When GPU features are enabled, the library automatically uses GPU if available
 //! and falls back to CPU if not.
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod coreml_bridge;
 pub mod hierarchy;
 
 use anyhow::{Context, Result};
@@ -729,7 +731,7 @@ const DEFAULT_GPU_BATCH_SIZE: usize = 64;
 /// ```
 #[derive(Clone)]
 pub struct Colbert {
-    sessions: Vec<Arc<Mutex<Session>>>,
+    sessions: Vec<Arc<Mutex<EncoderSession>>>,
     tokenizer: Arc<Tokenizer>,
     config: Arc<ColbertConfig>,
     skiplist_ids: Arc<HashSet<u32>>,
@@ -737,6 +739,12 @@ pub struct Colbert {
     pub requested_execution_provider: ExecutionProvider,
     batch_size: usize,
     dynamic_batch: bool,
+}
+
+enum EncoderSession {
+    Onnx(Session),
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    CoreMl(coreml_bridge::CoreMlSession),
 }
 
 pub struct PreparedDocumentBatch {
@@ -979,16 +987,18 @@ impl ColbertBuilder {
 
     /// Build the Colbert model.
     pub fn build(self) -> Result<Colbert> {
-        init_ort_runtime();
-
         let model_dir = &self.model_dir;
-        let onnx_path = select_onnx_file(model_dir, self.quantized)?;
         let tokenizer_path = model_dir.join("tokenizer.json");
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 
         let mut config = ColbertConfig::from_model_dir(model_dir)?;
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let native_coreml = coreml_bridge::compiled_model_path(model_dir).is_some();
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let native_coreml = false;
 
         // Set query_length and document_length:
         // - If user provided a value, use it
@@ -998,6 +1008,15 @@ impl ColbertBuilder {
         }
         if let Some(document_length) = self.document_length {
             config.document_length = document_length;
+        }
+
+        // MXBAI's compiled CoreML encoders accept fixed 256-token sequences:
+        // one row for queries and eight rows for document indexing. Its upstream
+        // ONNX metadata declares a 512-token document length, so clamp both
+        // inputs after all caller overrides are applied.
+        if native_coreml {
+            config.query_length = config.query_length.min(256);
+            config.document_length = config.document_length.min(256);
         }
 
         update_token_ids(&mut config, &tokenizer);
@@ -1017,30 +1036,54 @@ impl ColbertBuilder {
         };
 
         let mut sessions = Vec::with_capacity(self.num_sessions);
-        for _i in 0..self.num_sessions {
-            let builder = Session::builder()
-                .map_err(|e| anyhow::anyhow!("Failed to create ONNX session builder: {e:?}"))?
-                .with_optimization_level(GraphOptimizationLevel::Level3)
-                .map_err(|e| anyhow::anyhow!("Failed to set ONNX optimization level: {e:?}"))?
-                .with_intra_threads(threads_per_session)
-                .map_err(|e| anyhow::anyhow!("Failed to set ONNX intra-op threads: {e:?}"))?
-                .with_inter_threads(if self.num_sessions > 1 { 1 } else { 2 })
-                .map_err(|e| anyhow::anyhow!("Failed to set ONNX inter-op threads: {e:?}"))?;
-            // Disable memory pattern optimization for all providers.
-            // On CPU this helps with variable-length sequences (~7% speedup).
-            // On GPU this prevents ORT from pre-allocating a large memory arena
-            // that can cause OOM on GPUs with limited free memory.
-            let builder = builder
-                .with_memory_pattern(false)
-                .map_err(|e| anyhow::anyhow!("Failed to configure ONNX memory pattern: {e:?}"))?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if native_coreml {
+            let (query_model_path, document_model_path) =
+                match coreml_bridge::compiled_model_path(model_dir)
+                    .expect("native CoreML requires a compiled model bundle")
+                {
+                    coreml_bridge::CoreMlModels::QueryOnly(query) => (query, None),
+                    coreml_bridge::CoreMlModels::QueryAndB8 { query, document } => {
+                        (query, Some(document))
+                    }
+                };
+            sessions.push(Arc::new(Mutex::new(EncoderSession::CoreMl(
+                coreml_bridge::CoreMlSession::new(
+                    query_model_path,
+                    document_model_path,
+                    self.execution_provider == ExecutionProvider::Cpu,
+                )?,
+            ))));
+        }
 
-            let builder = configure_execution_provider(builder, self.execution_provider)?;
+        if sessions.is_empty() {
+            init_ort_runtime();
+            let onnx_path = select_onnx_file(model_dir, self.quantized)?;
+            for _i in 0..self.num_sessions {
+                let builder = Session::builder()
+                    .map_err(|e| anyhow::anyhow!("Failed to create ONNX session builder: {e:?}"))?
+                    .with_optimization_level(GraphOptimizationLevel::Level3)
+                    .map_err(|e| anyhow::anyhow!("Failed to set ONNX optimization level: {e:?}"))?
+                    .with_intra_threads(threads_per_session)
+                    .map_err(|e| anyhow::anyhow!("Failed to set ONNX intra-op threads: {e:?}"))?
+                    .with_inter_threads(if self.num_sessions > 1 { 1 } else { 2 })
+                    .map_err(|e| anyhow::anyhow!("Failed to set ONNX inter-op threads: {e:?}"))?;
+                // Disable memory pattern optimization for all providers.
+                // On CPU this helps with variable-length sequences (~7% speedup).
+                // On GPU this prevents ORT from pre-allocating a large memory arena
+                // that can cause OOM on GPUs with limited free memory.
+                let builder = builder.with_memory_pattern(false).map_err(|e| {
+                    anyhow::anyhow!("Failed to configure ONNX memory pattern: {e:?}")
+                })?;
 
-            let session = builder
-                .commit_from_file(&onnx_path)
-                .context("Failed to load ONNX model")?;
+                let builder = configure_execution_provider(builder, self.execution_provider)?;
 
-            sessions.push(Arc::new(Mutex::new(session)));
+                let session = builder
+                    .commit_from_file(&onnx_path)
+                    .context("Failed to load ONNX model")?;
+
+                sessions.push(Arc::new(Mutex::new(EncoderSession::Onnx(session))));
+            }
         }
 
         // Determine batch size
@@ -1149,17 +1192,27 @@ impl Colbert {
             return Ok(Vec::new());
         }
 
+        let native_coreml = self.uses_native_coreml();
         let processed_texts = preprocess_texts(&self.config, documents);
         let tokenized = tokenize_processed_texts_individually(&self.tokenizer, &processed_texts)?;
         let truncate_limit = self.config.document_length.saturating_sub(1);
         let use_gpu_batch_modes =
             !matches!(self.requested_execution_provider, ExecutionProvider::Cpu);
-        let use_dynamic_batch = self.dynamic_batch && use_gpu_batch_modes;
+        // The native B8 encoder has one fixed [8, 256] execution shape. The
+        // dynamic batching planner derives smaller batches from colgrep's usual
+        // batch setting (one on CPU-oriented installs), causing every document
+        // to be padded independently to eight rows. Group fixed groups of eight
+        // instead, including a single masked tail batch.
+        let use_dynamic_batch = self.dynamic_batch && use_gpu_batch_modes && !native_coreml;
 
         // CPU path: simple fixed-size batches. Documents are batched in input
         // order with padding to the longest sequence in each batch.
         if !use_dynamic_batch {
-            let batch_docs = self.batch_size.max(1);
+            let batch_docs = if native_coreml {
+                self.native_coreml_document_batch_size()
+            } else {
+                self.batch_size.max(1)
+            };
             let mut batches = Vec::new();
 
             let mut tokenized_iter = tokenized.into_iter().enumerate();
@@ -1552,7 +1605,16 @@ impl Colbert {
     ) -> Result<Vec<Array2<f32>>> {
         let mut all_embeddings = Vec::with_capacity(texts.len());
 
-        for chunk in texts.chunks(self.batch_size) {
+        let chunk_size = if self.uses_native_coreml() {
+            if is_query {
+                1
+            } else {
+                self.native_coreml_document_batch_size()
+            }
+        } else {
+            self.batch_size.max(1)
+        };
+        for chunk in texts.chunks(chunk_size) {
             let mut session = self.sessions[0].lock().unwrap();
             let chunk_embeddings = encode_batch_with_session(
                 &mut session,
@@ -1577,10 +1639,16 @@ impl Colbert {
     ) -> Result<Vec<Array2<f32>>> {
         let num_sessions = self.sessions.len();
 
-        let chunks: Vec<Vec<&str>> = texts
-            .chunks(self.batch_size.max(1))
-            .map(|c| c.to_vec())
-            .collect();
+        let chunk_size = if self.uses_native_coreml() {
+            if is_query {
+                1
+            } else {
+                self.native_coreml_document_batch_size()
+            }
+        } else {
+            self.batch_size.max(1)
+        };
+        let chunks: Vec<Vec<&str>> = texts.chunks(chunk_size).map(|c| c.to_vec()).collect();
 
         let results: Vec<Result<Vec<Array2<f32>>>> = std::thread::scope(|s| {
             let handles: Vec<_> = chunks
@@ -1624,13 +1692,47 @@ impl Colbert {
         documents: Vec<String>,
     ) -> VecDeque<(usize, usize, Vec<String>)> {
         let mut queue = VecDeque::new();
-        let batch_size = self.batch_size.max(1);
+        let batch_size = if self.uses_native_coreml() {
+            self.native_coreml_document_batch_size()
+        } else {
+            self.batch_size.max(1)
+        };
 
         for (chunk_index, chunk) in documents.chunks(batch_size).enumerate() {
             queue.push_back((chunk_index, chunk_index * batch_size, chunk.to_vec()));
         }
 
         queue
+    }
+
+    fn uses_native_coreml(&self) -> bool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.sessions
+                .iter()
+                .any(|session| matches!(*session.lock().unwrap(), EncoderSession::CoreMl(_)))
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            false
+        }
+    }
+
+    fn native_coreml_document_batch_size(&self) -> usize {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.sessions
+                .iter()
+                .find_map(|session| match &*session.lock().unwrap() {
+                    EncoderSession::CoreMl(session) => Some(session.document_batch_size()),
+                    EncoderSession::Onnx(_) => None,
+                })
+                .unwrap_or(1)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            1
+        }
     }
 }
 
@@ -1955,7 +2057,7 @@ fn build_skiplist(config: &ColbertConfig, tokenizer: &Tokenizer) -> HashSet<u32>
 /// This ensures that long documents get the same number of content tokens
 /// as PyLate, where the prefix is inserted after initial tokenization.
 fn encode_batch_with_session(
-    session: &mut Session,
+    session: &mut EncoderSession,
     tokenizer: &Tokenizer,
     config: &ColbertConfig,
     skiplist_ids: &HashSet<u32>,
@@ -2285,7 +2387,7 @@ fn prepare_batch_from_tokenizer_encodings(
 }
 
 fn encode_prepared_batch_with_session(
-    session: &mut Session,
+    session: &mut EncoderSession,
     config: &ColbertConfig,
     skiplist_ids: &HashSet<u32>,
     prepared: PreparedDocumentBatch,
@@ -2307,6 +2409,80 @@ fn encode_prepared_batch_with_session(
         return Ok(Vec::new());
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let EncoderSession::CoreMl(session) = session {
+        if all_token_type_ids.is_some() {
+            anyhow::bail!("The native CoreML bridge does not support token_type_ids");
+        }
+        if is_query && batch_size != 1 {
+            anyhow::bail!("The native CoreML query encoder accepts one query at a time");
+        }
+        if !is_query && batch_size > 8 {
+            anyhow::bail!(
+                "The native CoreML document encoder accepts at most eight documents at a time"
+            );
+        }
+        let real_batch_size = batch_size;
+        let coreml_batch_size = if is_query {
+            1
+        } else {
+            session.document_batch_size()
+        };
+        let mut coreml_input_ids = vec![50284; coreml_batch_size * batch_max_len];
+        let mut coreml_attention_mask = vec![0; coreml_batch_size * batch_max_len];
+        coreml_input_ids[..all_input_ids.len()].copy_from_slice(&all_input_ids);
+        coreml_attention_mask[..all_attention_mask.len()].copy_from_slice(&all_attention_mask);
+        let (embedding_dim, output) = session.run(
+            coreml_batch_size,
+            batch_max_len,
+            &coreml_input_ids,
+            &coreml_attention_mask,
+            is_query,
+        )?;
+        let model_sequence_length = 256;
+        let trimmed_len = real_batch_size
+            .checked_mul(batch_max_len)
+            .and_then(|count| count.checked_mul(embedding_dim))
+            .context("CoreML output dimensions overflow")?;
+        let mut trimmed_output = Vec::with_capacity(trimmed_len);
+        for row in 0..real_batch_size {
+            let start = row
+                .checked_mul(model_sequence_length)
+                .and_then(|count| count.checked_mul(embedding_dim))
+                .context("CoreML output dimensions overflow")?;
+            let end = start
+                .checked_add(
+                    batch_max_len
+                        .checked_mul(embedding_dim)
+                        .context("CoreML output dimensions overflow")?,
+                )
+                .context("CoreML output dimensions overflow")?;
+            if end > output.len() {
+                anyhow::bail!("CoreML output is shorter than its declared dimensions");
+            }
+            trimmed_output.extend_from_slice(&output[start..end]);
+        }
+        return extract_embeddings_from_output(
+            config,
+            skiplist_ids,
+            batch_size,
+            batch_max_len,
+            &all_token_ids,
+            &original_lengths,
+            is_query,
+            filter_skiplist,
+            embedding_dim,
+            &trimmed_output,
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let EncoderSession::Onnx(session) = session
+    else {
+        unreachable!("CoreML sessions are only available on Apple Silicon");
+    };
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let EncoderSession::Onnx(session) = session;
     let input_ids_tensor = Tensor::from_array(([batch_size, batch_max_len], all_input_ids))?;
     let attention_mask_tensor =
         Tensor::from_array(([batch_size, batch_max_len], all_attention_mask))?;
@@ -2338,8 +2514,33 @@ fn encode_prepared_batch_with_session(
         };
 
     let embedding_dim = shape_slice[2] as usize;
-    let output_data = &output_owned;
+    extract_embeddings_from_output(
+        config,
+        skiplist_ids,
+        batch_size,
+        batch_max_len,
+        &all_token_ids,
+        &original_lengths,
+        is_query,
+        filter_skiplist,
+        embedding_dim,
+        &output_owned,
+    )
+}
 
+#[allow(clippy::too_many_arguments)]
+fn extract_embeddings_from_output(
+    config: &ColbertConfig,
+    skiplist_ids: &HashSet<u32>,
+    batch_size: usize,
+    batch_max_len: usize,
+    all_token_ids: &[Vec<u32>],
+    original_lengths: &[usize],
+    is_query: bool,
+    filter_skiplist: bool,
+    embedding_dim: usize,
+    output_data: &[f32],
+) -> Result<Vec<Array2<f32>>> {
     let mut all_embeddings = Vec::with_capacity(batch_size);
     for i in 0..batch_size {
         let batch_offset = i * batch_max_len * embedding_dim;

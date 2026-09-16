@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::acceleration::apply_acceleration_mode;
 use crate::acceleration::{env_acceleration_mode_lossy, AccelerationMode};
 use crate::embed::build_embedding_text;
+use crate::model::uses_native_coreml;
 use crate::parser::{build_call_graph, detect_language, extract_units, CodeUnit, Language};
 use crate::signal::{is_interrupted, is_interrupted_outside_critical, CriticalSectionGuard};
 
@@ -1208,6 +1209,7 @@ impl IndexBuilder {
     ///   available, as GPU initialization overhead outweighs the benefits for small workloads.
     fn ensure_model_created(&mut self, num_units: usize) -> Result<()> {
         if self.model.is_none() {
+            let native_coreml = uses_native_coreml(&self.model_id, &self.model_path);
             #[cfg(feature = "_cuda")]
             let acceleration_mode = env_acceleration_mode_lossy();
 
@@ -1216,8 +1218,10 @@ impl IndexBuilder {
                 match acceleration_mode {
                     AccelerationMode::ForceCpu => {
                         apply_acceleration_mode(AccelerationMode::ForceCpu);
-                        crate::onnx_runtime::ensure_onnx_runtime()
-                            .context("Failed to initialize ONNX Runtime")?;
+                        if !native_coreml {
+                            crate::onnx_runtime::ensure_onnx_runtime()
+                                .context("Failed to initialize ONNX Runtime")?;
+                        }
 
                         (
                             self.parallel_sessions.unwrap_or_else(|| {
@@ -1228,14 +1232,16 @@ impl IndexBuilder {
                     }
                     AccelerationMode::ForceGpu => {
                         apply_acceleration_mode(AccelerationMode::ForceGpu);
-                        crate::onnx_runtime::ensure_onnx_runtime()
-                            .context("Failed to initialize ONNX Runtime")?;
+                        if !native_coreml {
+                            crate::onnx_runtime::ensure_onnx_runtime()
+                                .context("Failed to initialize ONNX Runtime")?;
+                        }
 
-                        if !crate::onnx_runtime::is_cudnn_available() {
+                        if !native_coreml && !crate::onnx_runtime::is_cudnn_available() {
                             anyhow::bail!("FORCE_GPU is set, but cuDNN was not initialized");
                         }
 
-                        if !next_plaid_onnx::is_cuda_available() {
+                        if !native_coreml && !next_plaid_onnx::is_cuda_available() {
                             anyhow::bail!(
                                 "FORCE_GPU is set, but the CUDA execution provider was not initialized"
                             );
@@ -1255,10 +1261,12 @@ impl IndexBuilder {
                             apply_acceleration_mode(AccelerationMode::Auto);
                         }
 
-                        crate::onnx_runtime::ensure_onnx_runtime()
-                            .context("Failed to initialize ONNX Runtime")?;
+                        if !native_coreml {
+                            crate::onnx_runtime::ensure_onnx_runtime()
+                                .context("Failed to initialize ONNX Runtime")?;
+                        }
 
-                        let use_cuda = !force_cpu && {
+                        let use_cuda = !native_coreml && !force_cpu && {
                             crate::onnx_runtime::is_cudnn_available()
                                 && next_plaid_onnx::is_cuda_available()
                         };
@@ -1290,8 +1298,10 @@ impl IndexBuilder {
                 feature = "coreml"
             )))]
             let (num_sessions, execution_provider) = {
-                crate::onnx_runtime::ensure_onnx_runtime()
-                    .context("Failed to initialize ONNX Runtime")?;
+                if !native_coreml {
+                    crate::onnx_runtime::ensure_onnx_runtime()
+                        .context("Failed to initialize ONNX Runtime")?;
+                }
 
                 (
                     self.parallel_sessions.unwrap_or_else(|| {
@@ -1308,8 +1318,10 @@ impl IndexBuilder {
                     env_acceleration_mode_lossy(),
                 );
 
-                crate::onnx_runtime::ensure_onnx_runtime()
-                    .context("Failed to initialize ONNX Runtime")?;
+                if !native_coreml {
+                    crate::onnx_runtime::ensure_onnx_runtime()
+                        .context("Failed to initialize ONNX Runtime")?;
+                }
 
                 (
                     self.parallel_sessions.unwrap_or_else(|| {
@@ -1319,8 +1331,24 @@ impl IndexBuilder {
                 )
             };
 
+            // This model is already a compiled CoreML bundle; its native bridge
+            // must not inherit colgrep's conservative CoreML-ONNX CPU default.
+            let execution_provider = if native_coreml {
+                match env_acceleration_mode_lossy() {
+                    AccelerationMode::ForceCpu => ExecutionProvider::Cpu,
+                    AccelerationMode::Auto | AccelerationMode::ForceGpu => ExecutionProvider::Auto,
+                }
+            } else {
+                execution_provider
+            };
+
             // Print model info after ONNX runtime is initialized (and any potential re-exec)
-            eprintln!("🤖 Model: {} ({})", self.model_id, execution_provider);
+            let provider = if native_coreml {
+                "native CoreML".to_string()
+            } else {
+                execution_provider.to_string()
+            };
+            eprintln!("🤖 Model: {} ({})", self.model_id, provider);
             eprintln!("📂 Building index...");
 
             // Use runtime default for batch size (respects cuDNN availability)
@@ -3916,8 +3944,16 @@ impl Searcher {
         let vector_dir = get_vector_index_path(&index_dir);
         let index_path = vector_dir.to_str().unwrap().to_string();
 
+        let native_coreml = uses_native_coreml(model_id, model_path);
         let acceleration_mode = env_acceleration_mode_lossy();
-        let execution_provider = execution_provider_for_acceleration_mode(acceleration_mode);
+        let execution_provider = if native_coreml {
+            match acceleration_mode {
+                AccelerationMode::ForceCpu => ExecutionProvider::Cpu,
+                AccelerationMode::ForceGpu | AccelerationMode::Auto => ExecutionProvider::Auto,
+            }
+        } else {
+            execution_provider_for_acceleration_mode(acceleration_mode)
+        };
 
         #[cfg(feature = "_cuda")]
         match acceleration_mode {
@@ -3927,10 +3963,13 @@ impl Searcher {
             }
         }
 
-        crate::onnx_runtime::ensure_onnx_runtime().context("Failed to initialize ONNX Runtime")?;
+        if !native_coreml {
+            crate::onnx_runtime::ensure_onnx_runtime()
+                .context("Failed to initialize ONNX Runtime")?;
+        }
 
         #[cfg(feature = "_cuda")]
-        if matches!(acceleration_mode, AccelerationMode::ForceGpu) {
+        if !native_coreml && matches!(acceleration_mode, AccelerationMode::ForceGpu) {
             if !crate::onnx_runtime::is_cudnn_available() {
                 anyhow::bail!("FORCE_GPU is set, but cuDNN was not initialized");
             }
@@ -3982,8 +4021,16 @@ impl Searcher {
         let vector_dir = get_vector_index_path(index_dir);
         let index_path = vector_dir.to_str().unwrap().to_string();
 
+        let native_coreml = uses_native_coreml("", model_path);
         let acceleration_mode = env_acceleration_mode_lossy();
-        let execution_provider = execution_provider_for_acceleration_mode(acceleration_mode);
+        let execution_provider = if native_coreml {
+            match acceleration_mode {
+                AccelerationMode::ForceCpu => ExecutionProvider::Cpu,
+                AccelerationMode::ForceGpu | AccelerationMode::Auto => ExecutionProvider::Auto,
+            }
+        } else {
+            execution_provider_for_acceleration_mode(acceleration_mode)
+        };
 
         #[cfg(feature = "_cuda")]
         match acceleration_mode {
@@ -3993,10 +4040,13 @@ impl Searcher {
             }
         }
 
-        crate::onnx_runtime::ensure_onnx_runtime().context("Failed to initialize ONNX Runtime")?;
+        if !native_coreml {
+            crate::onnx_runtime::ensure_onnx_runtime()
+                .context("Failed to initialize ONNX Runtime")?;
+        }
 
         #[cfg(feature = "_cuda")]
-        if matches!(acceleration_mode, AccelerationMode::ForceGpu) {
+        if !native_coreml && matches!(acceleration_mode, AccelerationMode::ForceGpu) {
             if !crate::onnx_runtime::is_cudnn_available() {
                 anyhow::bail!("FORCE_GPU is set, but cuDNN was not initialized");
             }
