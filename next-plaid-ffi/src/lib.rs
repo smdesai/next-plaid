@@ -476,7 +476,7 @@ pub fn store_documents(
 pub fn get_documents(path: String, doc_ids: Vec<i64>) -> FfiResult<Vec<String>> {
     let rows = next_plaid::filtering::get(&path, None, &[], Some(doc_ids.as_slice()))?;
     rows.iter()
-        .map(|v| serde_json::to_string(v))
+        .map(serde_json::to_string)
         .collect::<std::result::Result<_, _>>()
         .map_err(|e| FfiError::Invalid(format!("failed to serialize metadata row: {e}")))
 }
@@ -506,7 +506,7 @@ pub fn query_documents(
 
     let rows = next_plaid::filtering::get(&path, Some(&condition), values.as_slice(), None)?;
     rows.iter()
-        .map(|v| serde_json::to_string(v))
+        .map(serde_json::to_string)
         .collect::<std::result::Result<_, _>>()
         .map_err(|e| FfiError::Invalid(format!("failed to serialize metadata row: {e}")))
 }
@@ -646,7 +646,10 @@ mod tests {
         // Append two more docs along axes 3, 4.
         let new_ids = index
             .add(
-                vec![unit_matrix(&[3], DIM, TOKENS), unit_matrix(&[4], DIM, TOKENS)],
+                vec![
+                    unit_matrix(&[3], DIM, TOKENS),
+                    unit_matrix(&[4], DIM, TOKENS),
+                ],
                 update_config(),
             )
             .expect("add");
@@ -792,7 +795,9 @@ mod tests {
         // Store one text chunk per doc, keyed by the engine's doc ids 0..3.
         let doc_ids = vec![0_i64, 1, 2, 3];
         let metadata: Vec<String> = (0..4)
-            .map(|i| format!(r#"{{"documentName":"doc{i}","chunkText":"text-{i}","chunkIndex":0}}"#))
+            .map(|i| {
+                format!(r#"{{"documentName":"doc{i}","chunkText":"text-{i}","chunkIndex":0}}"#)
+            })
             .collect();
         let written = store_documents(path.clone(), doc_ids, metadata).expect("store");
         assert_eq!(written, 4);
@@ -827,7 +832,10 @@ mod tests {
             .search(unit_matrix(&[3], DIM, 1), search_params(3), None)
             .expect("search axis3 after");
         assert_eq!(hit3[0].doc_id, 2, "old id 3 should compact to id 2");
-        assert_eq!(stored_text(&path, hit3[0].doc_id).as_deref(), Some("text-3"));
+        assert_eq!(
+            stored_text(&path, hit3[0].doc_id).as_deref(),
+            Some("text-3")
+        );
     }
 
     #[test]
@@ -863,7 +871,9 @@ mod tests {
             .iter()
             .map(|s| {
                 let v: serde_json::Value = serde_json::from_str(s).expect("row json");
-                v.get("_subset_").and_then(|x| x.as_i64()).expect("_subset_")
+                v.get("_subset_")
+                    .and_then(|x| x.as_i64())
+                    .expect("_subset_")
             })
             .collect();
         assert_eq!(ids, vec![0, 1], "only A's chunk ids, ordered");
