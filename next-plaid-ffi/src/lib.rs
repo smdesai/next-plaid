@@ -214,8 +214,9 @@ fn matrix_to_array2(m: &EmbeddingMatrix) -> FfiResult<Array2<f32>> {
         )));
     }
     let mut values = Vec::with_capacity(rows * cols);
-    for chunk in m.data.chunks_exact(4) {
-        values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    let (chunks, _) = m.data.as_chunks::<4>();
+    for chunk in chunks {
+        values.push(f32::from_le_bytes(*chunk));
     }
     Array2::from_shape_vec((rows, cols), values)
         .map_err(|e| FfiError::Shape(format!("failed to build [{rows},{cols}] array: {e}")))
